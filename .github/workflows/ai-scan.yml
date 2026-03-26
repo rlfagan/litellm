@@ -1,0 +1,98 @@
+name: AI Component Scan
+
+on:
+  # Manual trigger with a repo URL input
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub/GitLab repo URL to scan (leave blank to scan THIS repo)"
+        required: false
+        default: ""
+
+  # Auto-scan this repo on every push to main
+  push:
+    branches: [main]
+
+  # Auto-scan on pull requests
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write   # so the action can post PR comments
+
+jobs:
+  scan:
+    name: Scan for AI Components
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout scanner repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Determine target repo URL
+        id: target
+        run: |
+          INPUT="${{ github.event.inputs.repo_url }}"
+          if [ -z "$INPUT" ]; then
+            echo "url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=$INPUT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run AI component scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Patch scan.py to skip webbrowser.open in CI
+          sed -i 's/webbrowser.open/# webbrowser.open/' scan.py
+          python scan.py "${{ steps.target.outputs.url }}"
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-scan-report
+          path: reports/*.html
+          retention-days: 30
+
+      - name: Upload Markdown report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-scan-report-md
+          path: reports/*.md
+          retention-days: 30
+
+      - name: Post summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportsDir = 'reports';
+            const files = fs.readdirSync(reportsDir).filter(f => f.endsWith('.md'));
+            if (!files.length) { console.log('No report found'); return; }
+            const report = fs.readFileSync(path.join(reportsDir, files[0]), 'utf8');
+            // Post first 65000 chars (GH comment limit)
+            const body = `## 🔍 AI Component Scan Results\n\n${report.slice(0, 65000)}`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Post summary to job
+        run: |
+          MD=$(ls reports/*.md 2>/dev/null | head -1)
+          if [ -n "$MD" ]; then
+            cat "$MD" >> $GITHUB_STEP_SUMMARY
+          fi
