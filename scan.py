@@ -9,98 +9,151 @@ import os
 import tempfile
 import shutil
 import subprocess
-import asyncio
 from pathlib import Path
 from urllib.parse import urlparse
 
-from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage
+import anthropic
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+             "dist", "build", ".next", "vendor", "target"}
+SKIP_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff",
+             ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".zip", ".tar",
+             ".gz", ".pyc", ".min.js", ".min.css"}
+AI_INDICATOR_FILES = {
+    "requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py",
+    "setup.cfg", "Pipfile", "package.json", "go.mod", "Cargo.toml",
+    "Gemfile", "composer.json", "Dockerfile", "docker-compose.yml",
+    "docker-compose.yaml", ".env.example", "Makefile",
+}
+AI_KEYWORDS = {
+    "openai", "anthropic", "claude", "langchain", "llamaindex", "llama_index",
+    "huggingface", "transformers", "torch", "tensorflow", "keras", "jax",
+    "sklearn", "scikit", "spacy", "nltk", "gpt", "llm", "embedding",
+    "pinecone", "weaviate", "chroma", "faiss", "qdrant", "milvus",
+    "cohere", "gemini", "mistral", "ollama", "litellm", "openrouter",
+    "together", "replicate", "groq", "perplexity", "vectorstore",
+    "langsmith", "mlflow", "wandb",
+}
+
+MAX_FILE_SIZE = 100_000
+MAX_TOTAL_CHARS = 180_000
 
 
-SYSTEM_PROMPT = """You are an expert AI/ML code analyst. Your job is to analyze a cloned repository and identify every AI component it contains.
-
-After reading the codebase, produce a structured report covering:
-
-1. **AI Frameworks & Libraries** — e.g., OpenAI SDK, Anthropic SDK, LangChain, LlamaIndex, Hugging Face Transformers, PyTorch, TensorFlow, JAX, scikit-learn, spaCy, NLTK, etc.
-2. **LLM Integrations** — which models or APIs are called (GPT-4, Claude, Gemini, Llama, Mistral, etc.), how they are invoked, and what they are used for
-3. **Embedding & Vector Search** — embedding models, vector databases (Pinecone, Weaviate, Chroma, FAISS, pgvector, etc.)
-4. **AI Agents & Orchestration** — agent frameworks, tool use, function calling, multi-agent setups, memory systems
-5. **ML Models** — any trained models (loaded from files, HuggingFace Hub, ONNX, etc.)
-6. **Prompt Engineering** — prompt templates, system prompts, few-shot examples (note file locations)
-7. **AI Infrastructure** — MLflow, Weights & Biases, Ray, Kubeflow, model serving, etc.
-8. **Configuration & API Keys** — which AI service keys/endpoints are configured (env vars, config files)
-
-For each component found, note:
-- What it is
-- Where it appears (file path and approximate line numbers if possible)
-- What it is used for in the project
-
-Be thorough — check requirements files, pyproject.toml, package.json, Cargo.toml, go.mod, source code, config files, Dockerfiles, and CI configs.
-
-If no AI components are found, say so clearly.
-
-End with a **Summary** section listing all AI components found in a concise bullet list.
-"""
-
-
-def clone_repo(url: str, target_dir: str) -> bool:
-    """Clone a git repository to target_dir. Returns True on success."""
+def clone_repo(url, target_dir):
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc:
-        print(f"Error: '{url}' does not look like a valid URL.", file=sys.stderr)
+        print(f"Error: '{url}' is not a valid URL.", file=sys.stderr)
         return False
-
     print(f"Cloning {url} ...", flush=True)
     result = subprocess.run(
         ["git", "clone", "--depth=1", url, target_dir],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
-        print(f"Error cloning repo:\n{result.stderr}", file=sys.stderr)
+        print(f"Clone failed:\n{result.stderr}", file=sys.stderr)
         return False
     print("Clone complete.\n", flush=True)
     return True
 
 
-async def analyze_repo(repo_dir: str, repo_url: str) -> str:
-    """Run the Claude agent on the cloned repo and return the report."""
-    prompt = (
-        f"Analyze the repository cloned to the current directory.\n"
-        f"Original URL: {repo_url}\n\n"
-        "Examine the codebase thoroughly and produce a detailed report of all AI components found. "
-        "Start by listing files with Glob to get an overview, then read relevant files."
-    )
+def collect_repo_content(repo_dir):
+    root = Path(repo_dir)
+    chunks = []
+    total = 0
 
-    options = ClaudeAgentOptions(
-        cwd=repo_dir,
-        allowed_tools=["Glob", "Read", "Grep"],
-        system_prompt=SYSTEM_PROMPT,
-        permission_mode="default",
-        max_turns=50,
-    )
+    def has_ai_keyword(text):
+        low = text.lower()
+        return any(kw in low for kw in AI_KEYWORDS)
 
-    result_text = ""
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, ResultMessage):
-            result_text = message.result
-        elif isinstance(message, SystemMessage) and message.subtype == "init":
-            session_id = message.data.get("session_id", "")
-            print(f"Session: {session_id}\n", flush=True)
+    # Priority 1: known config/dependency files
+    for f in sorted(root.rglob("*")):
+        if total > MAX_TOTAL_CHARS:
+            break
+        if not f.is_file():
+            continue
+        if any(p in SKIP_DIRS for p in f.parts):
+            continue
+        if f.name in AI_INDICATOR_FILES:
+            try:
+                text = f.read_text(errors="replace")
+                rel = f.relative_to(root)
+                chunk = f"\n\n### {rel}\n```\n{text[:8000]}\n```"
+                chunks.append(chunk)
+                total += len(chunk)
+            except Exception:
+                pass
 
-    return result_text
+    # Priority 2: source files mentioning AI keywords
+    for f in sorted(root.rglob("*")):
+        if total > MAX_TOTAL_CHARS:
+            break
+        if not f.is_file() or f.name in AI_INDICATOR_FILES:
+            continue
+        if any(p in SKIP_DIRS for p in f.parts):
+            continue
+        if f.suffix.lower() in SKIP_EXTS:
+            continue
+        if f.stat().st_size > MAX_FILE_SIZE:
+            continue
+        try:
+            text = f.read_text(errors="replace")
+            if has_ai_keyword(text):
+                rel = f.relative_to(root)
+                chunk = f"\n\n### {rel}\n```\n{text[:6000]}\n```"
+                chunks.append(chunk)
+                total += len(chunk)
+        except Exception:
+            pass
+
+    return "".join(chunks) if chunks else "(no relevant files found)"
+
+
+def analyze_with_claude(repo_url, content):
+    client = anthropic.Anthropic()
+
+    system = """You are an expert AI/ML security and code analyst. Analyze repository files for AI components and produce a structured report.
+
+Cover these categories (skip any with no findings):
+1. **AI Frameworks & Libraries** - OpenAI, Anthropic, LangChain, LlamaIndex, HuggingFace, PyTorch, TensorFlow, LiteLLM, etc.
+2. **LLM Integrations** - which models/APIs are called, how, and what for
+3. **Embeddings & Vector Search** - embedding models, vector DBs (Pinecone, Chroma, FAISS, pgvector, etc.)
+4. **AI Agents & Orchestration** - agent frameworks, tool use, memory, multi-agent
+5. **ML Models** - trained models loaded from files, HuggingFace Hub, ONNX, etc.
+6. **Prompt Engineering** - prompt templates, system prompts, few-shot examples (with file paths)
+7. **AI Infrastructure** - MLflow, W&B, Ray, model serving, etc.
+8. **Security Concerns** - known vulnerable AI libraries (e.g. LiteLLM CVEs), hardcoded keys, unsafe model deserialization
+
+For each finding: what it is, where (file path), what it does.
+End with a **Summary** bullet list of all AI components found."""
+
+    user = f"Analyze this repository for AI components.\nURL: {repo_url}\n\nRepository file contents:\n{content}"
+
+    print("Sending to Claude for analysis...\n", flush=True)
+
+    with client.messages.stream(
+        model="claude-opus-4-6",
+        max_tokens=8192,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    ) as stream:
+        result = []
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            result.append(text)
+        print("\n")
+        return "".join(result)
 
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python scan.py <github-or-gitlab-url>")
-        print("Example: python scan.py https://github.com/anthropics/anthropic-sdk-python")
+        print("Example: python scan.py https://github.com/rlfagan/litellm")
         sys.exit(1)
 
     repo_url = sys.argv[1].rstrip("/")
 
-    # Check for ANTHROPIC_API_KEY
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
+        print("Error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
 
     tmp_dir = tempfile.mkdtemp(prefix="claudescan_")
@@ -111,12 +164,13 @@ def main():
         if not clone_repo(repo_url, repo_dir):
             sys.exit(1)
 
-        print("Analyzing repository for AI components...\n", flush=True)
+        print("Collecting AI-relevant files...", flush=True)
+        content = collect_repo_content(repo_dir)
+        print(f"Collected {len(content):,} chars from repo.\n", flush=True)
         print("=" * 70)
 
-        report = asyncio.run(analyze_repo(repo_dir, repo_url))
+        analyze_with_claude(repo_url, content)
 
-        print(report)
         print("=" * 70)
 
     finally:
